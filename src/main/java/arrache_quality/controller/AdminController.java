@@ -22,6 +22,7 @@ import arrache_quality.repository.ArracheRepository;
 import arrache_quality.repository.NotificationRepository;
 import arrache_quality.repository.TrackingSheetRepository;
 import arrache_quality.repository.UserRepository;
+import arrache_quality.service.ArracheStatsService;
 import lombok.RequiredArgsConstructor;
 
 @RestController
@@ -36,6 +37,7 @@ public class AdminController {
     @SuppressWarnings("unused")
     private final NotificationRepository notificationRepository;
     private final PasswordEncoder passwordEncoder;
+    private final ArracheStatsService arracheStatsService;
 
     // ───────── READ ─────────
 
@@ -75,12 +77,15 @@ public class AdminController {
         return stats;
     }
 
+    /** One-shot backfill: scans full history and recomputes risk stats for every arrache. */
+    @PostMapping("/stats/recompute")
+    public Map<String, Object> recomputeStats() {
+        int count = arracheStatsService.recomputeAll();
+        return Map.of("recomputed", count);
+    }
+
     // ───────── CREATE ─────────
 
-    /**
-     * Create a user. For REPARATEUR with a valiseId, automatically clears that
-     * valise from any other user that previously held it.
-     */
     @PostMapping("/users")
     public ResponseEntity<?> createUser(@RequestBody User payload) {
         if (payload.getUsername() == null || userRepository.findByUsername(payload.getUsername()).isPresent()) {
@@ -93,7 +98,6 @@ public class AdminController {
         payload.setPassword(passwordEncoder.encode(payload.getPassword()));
         payload.setActive(true);
 
-        // Only REPARATEUR can hold a valise
         if ("REPARATEUR".equals(payload.getRole())
                 && payload.getValiseId() != null
                 && !payload.getValiseId().isEmpty()) {
@@ -107,11 +111,6 @@ public class AdminController {
 
     // ───────── UPDATE ─────────
 
-    /**
-     * Partial update. Body may contain any of: fullName, matricule, role, valiseId.
-     * If role changes away from REPARATEUR, the valise assignment is cleared.
-     * If valiseId is reassigned, the previous holder is unassigned.
-     */
     @PutMapping("/users/{id}")
     public ResponseEntity<?> updateUser(@PathVariable String id, @RequestBody Map<String, Object> updates) {
         User user = userRepository.findById(id)
@@ -121,7 +120,6 @@ public class AdminController {
         if (updates.containsKey("matricule")) user.setMatricule((String) updates.get("matricule"));
         if (updates.containsKey("role"))      user.setRole((String) updates.get("role"));
 
-        // Handle valise assignment
         if (updates.containsKey("valiseId")) {
             String newValiseId = (String) updates.get("valiseId");
             if (newValiseId == null || newValiseId.isEmpty()) {
@@ -130,10 +128,8 @@ public class AdminController {
                 clearValiseFromOtherUsers(newValiseId, id);
                 user.setValiseId(newValiseId);
             }
-            // Non-REPARATEUR with a valiseId in the payload is silently ignored
         }
 
-        // If role moved away from REPARATEUR, drop any leftover valise
         if (!"REPARATEUR".equals(user.getRole())) {
             user.setValiseId(null);
         }
@@ -159,7 +155,6 @@ public class AdminController {
 
     // ───────── helpers ─────────
 
-    /** Clear `valiseId` on every user that holds the given valise, except `exceptUserId` (nullable). */
     private void clearValiseFromOtherUsers(String valiseId, String exceptUserId) {
         if (valiseId == null) return;
         userRepository.findAll().stream()
