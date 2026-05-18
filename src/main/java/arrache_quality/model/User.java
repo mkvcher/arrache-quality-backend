@@ -19,9 +19,13 @@ public class User {
     private String username;
 
     private String password;
-    private String role; // REPARATEUR, QM_AGENT, LABORATORY
+    private String role; // REPARATEUR, QM_AGENT, LABORATORY, ADMIN
     private String matricule;
     private String fullName;
     private boolean active = true;
+
+    /** Only meaningful when role = REPARATEUR. Each réparateur has exactly one valise. */
+    private String valiseId;
+
     private LocalDateTime createdAt = LocalDateTime.now();
 }

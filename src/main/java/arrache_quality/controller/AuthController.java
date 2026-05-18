@@ -1,10 +1,14 @@
 package arrache_quality.controller;
 
+import java.util.HashMap;
 import java.util.Map;
 
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.web.bind.annotation.CrossOrigin;
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -43,17 +47,42 @@ public class AuthController {
         User user = userRepository.findByUsername(username)
                 .orElseThrow(() -> new RuntimeException("User not found"));
 
+        if (!user.isActive()) {
+            return ResponseEntity.status(403).body("Account is deactivated");
+        }
+
         if (!passwordEncoder.matches(password, user.getPassword())) {
             return ResponseEntity.status(401).body("Invalid password");
         }
 
         String token = jwtUtil.generateToken(user.getUsername(), user.getRole());
 
-        return ResponseEntity.ok(Map.of(
-                "token", token,
-                "role", user.getRole(),
-                "username", user.getUsername(),
-                "fullName", user.getFullName()
-        ));
+        return ResponseEntity.ok(buildUserResponse(user, token));
+    }
+
+    /** Returns the currently authenticated user's profile (fresh from DB). */
+    @GetMapping("/me")
+    public ResponseEntity<?> me() {
+        Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+        if (auth == null || auth.getName() == null) {
+            return ResponseEntity.status(401).body("Not authenticated");
+        }
+        User user = userRepository.findByUsername(auth.getName())
+                .orElseThrow(() -> new RuntimeException("User not found"));
+        // Token isn't reissued here — caller already has one
+        return ResponseEntity.ok(buildUserResponse(user, null));
+    }
+
+    private Map<String, Object> buildUserResponse(User user, String token) {
+        Map<String, Object> response = new HashMap<>();
+        if (token != null) response.put("token", token);
+        response.put("id", user.getId());
+        response.put("username", user.getUsername());
+        response.put("role", user.getRole());
+        response.put("matricule", user.getMatricule());
+        response.put("fullName", user.getFullName());
+        response.put("valiseId", user.getValiseId());
+        response.put("active", user.isActive());
+        return response;
     }
 }
