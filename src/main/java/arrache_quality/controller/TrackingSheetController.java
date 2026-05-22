@@ -1,5 +1,6 @@
 package arrache_quality.controller;
 
+import java.time.LocalDate;
 import java.util.List;
 
 import org.springframework.http.ResponseEntity;
@@ -49,6 +50,17 @@ public class TrackingSheetController {
         return trackingSheetRepository.findByValiseId(valiseId);
     }
 
+    /** All tracking sheets for the current quarter — used by analytics charts. */
+    @GetMapping("/current-quarter")
+    public List<TrackingSheet> getCurrentQuarter() {
+        LocalDate today = LocalDate.now();
+        int quarter = (today.getMonthValue() - 1) / 3 + 1;
+        int year = today.getYear();
+        return trackingSheetRepository.findAll().stream()
+                .filter(s -> s.getQuarter() == quarter && s.getYear() == year)
+                .toList();
+    }
+
     @PostMapping("/{id}/weekly")
     public TrackingSheet addWeeklyCheck(
             @PathVariable String id,
@@ -58,9 +70,7 @@ public class TrackingSheetController {
         sheet.getWeeklyChecks().add(weeklyCheck);
         TrackingSheet saved = trackingSheetRepository.save(sheet);
 
-        // 1) Notifications (rupture + pattern detection)
         notificationService.afterWeeklyCheck(saved, weeklyCheck);
-        // 2) Recompute risk stats for every arrache in this sheet
         arracheStatsService.recomputeForSheet(saved);
 
         return saved;

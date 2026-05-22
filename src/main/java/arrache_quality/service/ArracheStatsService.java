@@ -19,15 +19,19 @@ import arrache_quality.repository.TrackingSheetRepository;
 import lombok.RequiredArgsConstructor;
 
 /**
- * Recomputes derived statistics for arraches based on the full inspection history.
+ * Recomputes derived statistics for arraches from the full inspection history.
  *
  * Risk score formula (0–100):
- *   · 40% — weekly NOK frequency (weeklyNokCount / weeklyTotal)
+ *   · 40% — weighted NOK frequency (weekly ×1, monthly ×2, quarterly ×3)
  *   · 30% — rupture ever observed (binary)
  *   · 20% — consecutive NOK weeks (5 pts per week, capped at 4 = 20)
  *   · 10% — age in days (full at 365 days)
  *
- * Status auto-update (only when not already NON_CONFORME, which is owned by the lab):
+ * The weighting reflects inspection seniority: the laboratory's quarterly verdict
+ * is the authoritative one, the QM agent's monthly check is intermediate, and the
+ * réparateur's weekly check is the day-to-day pulse.
+ *
+ * Status auto-update (only when not already NON_CONFORME — lab decision is sticky):
  *   · rupture ever seen → NON_CONFORME
  *   · risk > 60         → DEFECTIVE
  *   · else              → OPERATIONAL
@@ -43,6 +47,11 @@ public class ArracheStatsService {
     private static final double WEIGHT_CONSECUTIVE = 20.0;
     private static final double WEIGHT_AGE         = 10.0;
 
+    // Inspection-type weights for the NOK frequency component
+    private static final int WEEKLY_WEIGHT    = 1;
+    private static final int MONTHLY_WEIGHT   = 2;
+    private static final int QUARTERLY_WEIGHT = 3;
+
     private static final double DEFECTIVE_THRESHOLD = 60.0;
 
     private final ArracheRepository arracheRepository;
@@ -50,14 +59,12 @@ public class ArracheStatsService {
 
     // ───────── Public API ─────────
 
-    /** Recompute stats for every arrache mentioned anywhere in the sheet. */
     public void recomputeForSheet(TrackingSheet sheet) {
         if (sheet == null) return;
         Set<String> arracheIds = collectArracheIds(sheet);
         arracheIds.forEach(this::recomputeForArrache);
     }
 
-    /** Backfill helper — recomputes every arrache in the database. */
     public int recomputeAll() {
         List<Arrache> all = arracheRepository.findAll();
         all.forEach(a -> recomputeForArrache(a.getId()));
@@ -65,15 +72,18 @@ public class ArracheStatsService {
         return all.size();
     }
 
-    /** Core: rebuild every derived field for a single arrache from full history. */
     public void recomputeForArrache(String arracheId) {
         if (arracheId == null) return;
         Arrache arrache = arracheRepository.findById(arracheId).orElse(null);
         if (arrache == null) return;
 
+        // Raw counts for display + weighted accumulators for the score
         int totalNok = 0;
-        int totalChecks = 0;
         boolean ruptureSeen = false;
+
+        int weightedNok = 0;     // Σ (weight × isNok)
+        int weightedTotal = 0;   // Σ (weight × 1 per check involving this arrache)
+
         List<WeeklyEntry> weeklyEntries = new ArrayList<>();
 
         for (TrackingSheet sheet : trackingSheetRepository.findAll()) {
@@ -83,11 +93,12 @@ public class ArracheStatsService {
                     if (wc.getResults() == null) continue;
                     for (TrackingSheet.ArracheResult r : wc.getResults()) {
                         if (!arracheId.equals(r.getArracheId())) continue;
-                        totalChecks++;
                         boolean isNok = "NOK".equals(r.getResult());
                         weeklyEntries.add(new WeeklyEntry(sheet.getYear(), wc.getWeekNumber(), isNok));
+                        weightedTotal += WEEKLY_WEIGHT;
                         if (isNok) {
                             totalNok++;
+                            weightedNok += WEEKLY_WEIGHT;
                             if (r.getNokReasons() != null && r.getNokReasons().isRupture()) {
                                 ruptureSeen = true;
                             }
@@ -101,9 +112,10 @@ public class ArracheStatsService {
                     if (mc.getResults() == null) continue;
                     for (TrackingSheet.ArracheResult r : mc.getResults()) {
                         if (!arracheId.equals(r.getArracheId())) continue;
-                        totalChecks++;
+                        weightedTotal += MONTHLY_WEIGHT;
                         if ("NOK".equals(r.getResult())) {
                             totalNok++;
+                            weightedNok += MONTHLY_WEIGHT;
                             if (r.getNokReasons() != null && r.getNokReasons().isRupture()) {
                                 ruptureSeen = true;
                             }
@@ -115,9 +127,10 @@ public class ArracheStatsService {
             if (sheet.getQuarterlyVerdict() != null && sheet.getQuarterlyVerdict().getResults() != null) {
                 for (TrackingSheet.ArracheResult r : sheet.getQuarterlyVerdict().getResults()) {
                     if (!arracheId.equals(r.getArracheId())) continue;
-                    totalChecks++;
+                    weightedTotal += QUARTERLY_WEIGHT;
                     if ("NOK".equals(r.getResult())) {
                         totalNok++;
+                        weightedNok += QUARTERLY_WEIGHT;
                         if (r.getNokReasons() != null && r.getNokReasons().isRupture()) {
                             ruptureSeen = true;
                         }
@@ -137,12 +150,9 @@ public class ArracheStatsService {
         }
 
         // ── Risk score components ──
-        long weeklyNok = weeklyEntries.stream().filter(WeeklyEntry::nok).count();
-        int weeklyTotal = weeklyEntries.size();
-
-        double frequencyScore = (weeklyTotal == 0)
+        double frequencyScore = (weightedTotal == 0)
                 ? 0.0
-                : ((double) weeklyNok / weeklyTotal) * WEIGHT_FREQUENCY;
+                : ((double) weightedNok / weightedTotal) * WEIGHT_FREQUENCY;
 
         double ruptureScore = ruptureSeen ? WEIGHT_RUPTURE : 0.0;
 
@@ -155,7 +165,6 @@ public class ArracheStatsService {
         }
 
         double riskScore = frequencyScore + ruptureScore + consecutiveScore + ageScore;
-        // Safety clamp
         if (riskScore < 0)   riskScore = 0;
         if (riskScore > 100) riskScore = 100;
 
@@ -165,7 +174,6 @@ public class ArracheStatsService {
         arrache.setConsecutiveNokWeeks(consecutiveNok);
         arrache.setRiskScore(riskScore);
 
-        // Status: lab-issued NON_CONFORME is sticky; otherwise auto-derive
         if (!"NON_CONFORME".equals(arrache.getStatus())) {
             if (ruptureSeen) {
                 arrache.setStatus("NON_CONFORME");
@@ -177,9 +185,6 @@ public class ArracheStatsService {
         }
 
         arracheRepository.save(arrache);
-
-        // Silence the unused-warning the IDE might emit
-        if (totalChecks < 0) log.debug("unreachable");
     }
 
     // ───────── helpers ─────────
